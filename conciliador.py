@@ -1,7 +1,9 @@
 import os
 import xml.etree.ElementTree as ET
 import shutil
+import re
 import pandas as pd
+import pdfplumber
 
 # =====================================================================
 # 1. CONFIGURAÇÃO DOS CAMINHOS DE PASTAS
@@ -11,7 +13,7 @@ PASTA_PEDIDOS = "pedidos"
 PASTA_SAIDA = "saida"
 PASTA_PROCESSADOS = "processados"
 
-# Garante que as pastas existam. Se não existirem, o Python cria para você.
+# Garante que as pastas existam.
 for pasta in [PASTA_ENTRADA, PASTA_PEDIDOS, PASTA_SAIDA, PASTA_PROCESSADOS]:
     if not os.path.exists(pasta):
         os.makedirs(pasta)
@@ -20,76 +22,136 @@ for pasta in [PASTA_ENTRADA, PASTA_PEDIDOS, PASTA_SAIDA, PASTA_PROCESSADOS]:
 # 2. FUNÇÃO PARA EXTRAIR DADOS DE UM XML DE NF-e
 # =====================================================================
 def extrair_dados_xml(caminho_xml):
-    """
-    Abre o arquivo XML da NF-e e extrai os dados principais.
-    Nota: O XML da NF-e usa um sistema de 'namespaces' (aquela URL no início das tags).
-    """
     try:
         tree = ET.parse(caminho_xml)
         root = tree.getroot()
-        
-        # O XML da NF-e geralmente usa o namespace padrão da SEFAZ
         ns = {'ns': 'http://www.portalfiscal.inf.br/nfe'}
         
-        # Procurando as tags específicas usando o namespace
-        # (Se o seu XML não tiver namespace, use root.find('.//chNFe').text)
         chave_acesso = root.find('.//ns:chNFe', ns)
         if chave_acesso is None:
-            # Caso de contingência ou outra tag de chave
             chave_acesso = root.find('.//ns:infProt/ns:chNFe', ns)
             
         cnpj_emissor = root.find('.//ns:emit/ns:CNPJ', ns)
         valor_total = root.find('.//ns:ICMSTot/ns:vNF', ns)
         numero_nota = root.find('.//ns:ide/ns:nNF', ns)
         
-        # Extraindo o texto de dentro das tags (se encontradas)
         dados = {
             "Chave_Acesso": chave_acesso.text if chave_acesso is not None else "Não encontrada",
             "Numero_Nota": numero_nota.text if numero_nota is not None else "Não encontrado",
             "CNPJ_Emissor": cnpj_emissor.text if cnpj_emissor is not None else "Não encontrado",
             "Valor_Nota": float(valor_total.text) if valor_total is not None else 0.0,
-            "Nome_Arquivo": os.path.basename(caminho_xml)
+            "Nome_Arquivo": os.path.basename(caminho_xml),
+            "Tipo_Arquivo": "XML"
         }
         return dados
-        
     except Exception as e:
-        print(f"Erro ao ler o arquivo {caminho_xml}: {e}")
+        print(f"Erro ao ler o arquivo XML {caminho_xml}: {e}")
         return None
 
 # =====================================================================
-# 3. PROCESSO PRINCIPAL (FLUXO DO SCRIPT)
+# 3. FUNÇÃO PARA EXTRAIR DADOS DE UM PDF
+# =====================================================================
+def extrair_dados_pdf(caminho_pdf):
+    """
+    Abre o PDF, extrai o texto e tenta encontrar o CNPJ e o Valor Total da nota.
+    """
+    try:
+        texto_completo = ""
+        with pdfplumber.open(caminho_pdf) as pdf:
+            for pagina in pdf.pages:
+                texto_pagina = pagina.extract_text()
+                if texto_pagina:
+                    texto_completo += texto_pagina + "\n"
+        
+        # Procurando o CNPJ usando Expressão Regular (padrão de 14 dígitos com ou sem pontuação)
+        # Ex: 12.345.678/0001-99 ou 12345678000199
+        padrao_cnpj = r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}|\d{14})"
+        cnpjs_encontrados = re.findall(padrao_cnpj, texto_completo)
+        
+        # Limpa o CNPJ para ficar apenas com números
+        cnpj_limpo = "Não encontrado"
+        if cnpjs_encontrados:
+            # Pegamos o primeiro CNPJ encontrado (geralmente é o do emissor/prestador)
+            cnpj_limpo = re.sub(r"\D", "", cnpjs_encontrados[0])
+
+        # Procurando o Valor Total da Nota
+        # Procuramos palavras-chave como "VALOR TOTAL", "TOTAL DA NOTA", "VALOR LÍQUIDO" seguido de um número decimal
+        padrao_valor = r"(?:VALOR TOTAL|TOTAL DA NOTA|VALOR LÍQUIDO|TOTAL).*?(\d{1,3}(?:\.\d{3})*,\d{2})"
+        valores_encontrados = re.findall(padrao_valor, texto_completo, re.IGNORECASE)
+        
+        valor_nota = 0.0
+        if valores_encontrados:
+            # Pega o primeiro valor encontrado, substitui ponto por nada e vírgula por ponto para o Python entender como float
+            valor_texto = valores_encontrados[0].replace(".", "").replace(",", ".")
+            valor_nota = float(valor_texto)
+
+        # Como PDFs não têm uma chave de acesso fácil como o XML, tentamos achar ou geramos uma informação padrão
+        padrao_numero_nota = r"Nº\s*(\d+)|NÚMERO\s*(\d+)"
+        numeros_encontrados = re.findall(padrao_numero_nota, texto_completo, re.IGNORECASE)
+        numero_nota = "Não encontrado"
+        if numeros_encontrados:
+            # Filtra tuplas vazias do regex e pega o primeiro número
+            lista_numeros = [num for tupla in numeros_encontrados for num in tupla if num]
+            if lista_numeros:
+                numero_nota = lista_numeros[0]
+
+        dados = {
+            "Chave_Acesso": "N/A (PDF)",
+            "Numero_Nota": numero_nota,
+            "CNPJ_Emissor": cnpj_limpo,
+            "Valor_Nota": valor_nota,
+            "Nome_Arquivo": os.path.basename(caminho_pdf),
+            "Tipo_Arquivo": "PDF"
+        }
+        return dados
+    except Exception as e:
+        print(f"Erro ao ler o arquivo PDF {caminho_pdf}: {e}")
+        return None
+
+# =====================================================================
+# 4. PROCESSO PRINCIPAL (FLUXO DO SCRIPT)
 # =====================================================================
 def executar_conciliacao():
-    print("Iniciando o processo de conciliação...")
+    print("Iniciando o processo de conciliação (XML e PDF)...")
     
-    # 3.1. Ler todos os XMLs da pasta 'entrada'
+    # 4.1. Ler todos os arquivos da pasta 'entrada' (XML e PDF)
     notas_extraidas = []
-    arquivos_xml = [f for f in os.listdir(PASTA_ENTRADA) if f.endswith('.xml')]
+    arquivos = os.listdir(PASTA_ENTRADA)
     
-    if not arquivos_xml:
-        print("Nenhum arquivo XML encontrado na pasta 'entrada'. Adicione arquivos lá para testar!")
+    if not arquivos:
+        print("Nenhum arquivo XML ou PDF encontrado na pasta 'entrada'. Adicione arquivos lá para testar!")
         return
 
-    for arquivo in arquivos_xml:
+    for arquivo in arquivos:
         caminho_completo = os.path.join(PASTA_ENTRADA, arquivo)
-        dados = extrair_dados_xml(caminho_completo)
+        dados = None
         
+        if arquivo.lower().endswith('.xml'):
+            print(f"Lendo XML: {arquivo}")
+            dados = extrair_dados_xml(caminho_completo)
+        elif arquivo.lower().endswith('.pdf'):
+            print(f"Lendo PDF: {arquivo}")
+            dados = extrair_dados_pdf(caminho_completo)
+            
         if dados:
             notas_extraidas.append(dados)
-            # Move o arquivo processado para a pasta 'processados' para não ler de novo na próxima rodada
+            # Move o arquivo processado para não duplicar na próxima rodada
             shutil.move(caminho_completo, os.path.join(PASTA_PROCESSADOS, arquivo))
 
-    # Transforma as notas extraídas em uma tabela (DataFrame do Pandas)
-    df_notas = pd.DataFrame(notas_extraidas)
-    print(f"{len(df_notas)} notas fiscais lidas com sucesso.")
+    if not notas_extraidas:
+        print("Nenhum dado pôde ser extraído das notas fornecidas.")
+        return
 
-    # 3.2. Carregar a planilha de Pedidos de Compra
+    # Transforma as notas extraídas em tabela
+    df_notas = pd.DataFrame(notas_extraidas)
+    print(f"\n{len(df_notas)} notas lidas com sucesso.")
+
+    # 4.2. Carregar a planilha de Pedidos de Compra
     caminho_pedidos = os.path.join(PASTA_PEDIDOS, "pedidos_compra.xlsx")
     if not os.path.exists(caminho_pedidos):
-        print(f"Erro: Planilha de pedidos não encontrada em '{caminho_pedidos}'!")
-        # Vamos criar um arquivo de exemplo se ele não existir, para te ajudar no primeiro teste
+        # Cria uma de exemplo se não existir
         exemplo_pedidos = pd.DataFrame({
-            "CNPJ_Fornecedor": ["12345678000199"],  # Substitua pelo CNPJ real das suas notas de teste
+            "CNPJ_Fornecedor": ["12345678000199"],
             "Valor_Esperado": [1500.00]
         })
         exemplo_pedidos.to_excel(caminho_pedidos, index=False)
@@ -98,12 +160,11 @@ def executar_conciliacao():
 
     df_pedidos = pd.read_excel(caminho_pedidos)
     
-    # Garante que os CNPJs sejam tratados como texto para não dar erro na comparação
+    # Padroniza os CNPJs para comparação
     df_notas["CNPJ_Emissor"] = df_notas["CNPJ_Emissor"].astype(str).str.strip()
     df_pedidos["CNPJ_Fornecedor"] = df_pedidos["CNPJ_Fornecedor"].astype(str).str.strip()
 
-    # 3.3. Conciliação (Cruzamento de dados)
-    # Fazemos um 'merge' (como um PROCV do Excel) unindo pelo CNPJ
+    # 4.3. Conciliação (Cruzamento de dados)
     df_conciliado = pd.merge(
         df_notas, 
         df_pedidos, 
@@ -112,7 +173,7 @@ def executar_conciliacao():
         how="left"
     )
 
-    # Criamos uma coluna de status para validar os valores
+    # Função para validar valores
     def verificar_status(row):
         if pd.isna(row["Valor_Esperado"]):
             return "Pedido não encontrado no sistema"
@@ -125,14 +186,13 @@ def executar_conciliacao():
 
     df_conciliado["Status_Conciliacao"] = df_conciliado.apply(verificar_status, axis=1)
 
-    # 3.4. Salvar o resultado
+    # 4.4. Salvar o resultado
     caminho_relatorio = os.path.join(PASTA_SAIDA, "relatorio_conciliacao.xlsx")
     df_conciliado.to_excel(caminho_relatorio, index=False)
     
     print("\n--- PROCESSO CONCLUÍDO ---")
     print(f"Relatório gerado em: {caminho_relatorio}")
-    print(df_conciliado[["Numero_Nota", "Valor_Nota", "Status_Conciliacao"]])
+    print(df_conciliado[["Nome_Arquivo", "Tipo_Arquivo", "Valor_Nota", "Status_Conciliacao"]])
 
-# Executa o script
 if __name__ == "__main__":
     executar_conciliacao()
