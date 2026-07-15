@@ -63,34 +63,28 @@ def extrair_dados_pdf(caminho_pdf):
                 if texto_pagina:
                     texto_completo += texto_pagina + "\n"
         
-        # Procurando o CNPJ usando Expressão Regular (padrão de 14 dígitos com ou sem pontuação)
-        # Ex: 12.345.678/0001-99 ou 12345678000199
+        # Procurando o CNPJ usando Expressão Regular
         padrao_cnpj = r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}|\d{14})"
         cnpjs_encontrados = re.findall(padrao_cnpj, texto_completo)
         
-        # Limpa o CNPJ para ficar apenas com números
         cnpj_limpo = "Não encontrado"
         if cnpjs_encontrados:
-            # Pegamos o primeiro CNPJ encontrado (geralmente é o do emissor/prestador)
             cnpj_limpo = re.sub(r"\D", "", cnpjs_encontrados[0])
 
-        # Procurando o Valor Total da Nota
-        # Procuramos palavras-chave como "VALOR TOTAL", "TOTAL DA NOTA", "VALOR LÍQUIDO" seguido de um número decimal
-        padrao_valor = r"(?:VALOR TOTAL|TOTAL DA NOTA|VALOR LÍQUIDO|TOTAL).*?(\d{1,3}(?:\.\d{3})*,\d{2})"
+        # Procurando o Valor Total da Nota (Refinado para evitar falsos positivos)
+        padrao_valor = r"(?:VALOR TOTAL|TOTAL DA NOTA|VALOR LÍQUIDO|VALOR LIQUIDO|TOTAL DE SERVIÇOS|TOTAL DOS SERVIÇOS).*?(\d{1,3}(?:\.\d{3})*,\d{2})"
         valores_encontrados = re.findall(padrao_valor, texto_completo, re.IGNORECASE)
         
         valor_nota = 0.0
         if valores_encontrados:
-            # Pega o primeiro valor encontrado, substitui ponto por nada e vírgula por ponto para o Python entender como float
             valor_texto = valores_encontrados[0].replace(".", "").replace(",", ".")
             valor_nota = float(valor_texto)
 
-        # Como PDFs não têm uma chave de acesso fácil como o XML, tentamos achar ou geramos uma informação padrão
-        padrao_numero_nota = r"Nº\s*(\d+)|NÚMERO\s*(\d+)"
+        # Localizando o Número da Nota Fiscal
+        padrao_numero_nota = r"Nº\s*(\d+)|NÚMERO\s*(\d+)|NUMERO\s*(\d+)"
         numeros_encontrados = re.findall(padrao_numero_nota, texto_completo, re.IGNORECASE)
         numero_nota = "Não encontrado"
         if numeros_encontrados:
-            # Filtra tuplas vazias do regex e pega o primeiro número
             lista_numeros = [num for tupla in numeros_encontrados for num in tupla if num]
             if lista_numeros:
                 numero_nota = lista_numeros[0]
@@ -194,5 +188,6 @@ def executar_conciliacao():
     print(f"Relatório gerado em: {caminho_relatorio}")
     print(df_conciliado[["Nome_Arquivo", "Tipo_Arquivo", "Valor_Nota", "Status_Conciliacao"]])
 
+# Executa o script (garantindo que não há espaços vazios no início da linha)
 if __name__ == "__main__":
     executar_conciliacao()
