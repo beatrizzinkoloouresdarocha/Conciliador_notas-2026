@@ -23,14 +23,17 @@ for pasta in [PASTA_ENTRADA, PASTA_PEDIDOS, PASTA_SAIDA, PASTA_PROCESSADOS]:
 # =====================================================================
 def extrair_dados_xml(caminho_xml):
     try:
-        tree = ET.parse(caminho_xml)
-        root = tree.getroot()
+        # Lemos o arquivo como texto puro primeiro para limpar problemas de namespaces/prefixos
+        with open(caminho_xml, 'r', encoding='utf-8') as f:
+             xml_conteudo = f.read()
         
-        # Remove o namespace para facilitar a busca em qualquer tipo de XML (NF-e ou NFS-e)
-        xml_str = ET.tostring(root, encoding='utf-8').decode('utf-8')
-        xml_sem_ns = re.sub(r'\sxmlns="[^"]+"', '', xml_str, count=1)
-        xml_sem_ns = re.sub(r'\sxmlns:[^=]+="[^"]+"', '', xml_sem_ns)
-        root = ET.fromstring(xml_sem_ns)
+        # Remove qualquer prefixo de namespace (ex: <ns2:det> vira <det>) para evitar o erro 'unbound prefix'
+        xml_limpo = re.sub(r'<\/?\w+:', '<', xml_conteudo)
+        # Remove declarações de namespaces complexas
+        xml_limpo = re.sub(r'\sxmlns:[^=]+="[^"]+"', '', xml_limpo)
+        xml_limpo = re.sub(r'\sxmlns="[^"]+"', '', xml_limpo)
+        
+        root = ET.fromstring(xml_limpo)
         
         chave_acesso = root.find('.//chNFe')
         if chave_acesso is None:
@@ -133,7 +136,6 @@ def executar_conciliacao():
         print("Nenhum arquivo XML ou PDF encontrado na pasta 'entrada'. Adicione arquivos lá para testar!")
         return
 
-    # Filtra para ler apenas XML e PDF reais, ignorando planilhas Excel caso estejam lá sem querer
     arquivos_validos = [arq for arq in arquivos if arq.lower().endswith(('.xml', '.pdf'))]
 
     if not arquivos_validos:
@@ -161,7 +163,6 @@ def executar_conciliacao():
         print("Nenhum dado pôde ser extraído das notas fornecidas.")
         return
 
-    # Transforma as notas extraídas em tabela
     df_notas = pd.DataFrame(notas_extraidas)
     print(f"\n{len(df_notas)} notas lidas com sucesso.")
 
@@ -173,20 +174,17 @@ def executar_conciliacao():
 
     df_pedidos = pd.read_excel(caminho_pedidos)
     
-    # --- MAPEAMENTO E PADRONIZAÇÃO DE COLUNAS DA PLANILHA REAL ---
-    # Se as colunas estiverem no formato em português do seu arquivo real, renomeamos para o código entender:
+    # --- MAPEAMENTO E PADRONIZAÇÃO DE COLUNAS ---
     colunas_mapa = {
         "CNPJ do Fornecedor": "CNPJ_Fornecedor",
         "Valor do Pedido (R$)": "Valor_Esperado"
     }
     df_pedidos = df_pedidos.rename(columns=colunas_mapa)
 
-    # Garante que as colunas necessárias existam
     if "CNPJ_Fornecedor" not in df_pedidos.columns or "Valor_Esperado" not in df_pedidos.columns:
         print("Erro: A planilha de pedidos precisa conter as colunas de CNPJ e Valor do Pedido.")
         return
     
-    # Padroniza os CNPJs para comparação
     df_notas["CNPJ_Emissor"] = df_notas["CNPJ_Emissor"].astype(str).str.strip().str.replace(r"\D", "", regex=True)
     df_pedidos["CNPJ_Fornecedor"] = df_pedidos["CNPJ_Fornecedor"].astype(str).str.strip().str.replace(r"\D", "", regex=True)
 
@@ -199,31 +197,48 @@ def executar_conciliacao():
         how="left"
     )
 
-    # Função para validar valores
+    # Nova lógica melhorada de verificação com cálculo da diferença
     def verificar_status(row):
         if pd.isna(row["Valor_Esperado"]):
-            return "Atenção: Pedido de compra não localizado!"
-        elif row["Valor_Nota"] == row["Valor_Esperado"]:
-            return "Conciliado (Valores Batem!)"
-        elif row["Valor_Nota"] > row["Valor_Esperado"]:
-            diferenca = row["Valor_Nota"] - row["Valor_Esperado"]
-            return f"Divergência (Pedido: R$ {row['Valor_Esperado']:,.2f} | Nota: R$ {row['Valor_Nota']:,.2f})"
-        else:
-            return f"Divergência (Pedido: R$ {row['Valor_Esperado']:,.2f} | Nota: R$ {row['Valor_Nota']:,.2f})"
-
-    df_conciliado["Status_Conciliacao"] = df_conciliado.apply(verificar_status, axis=1)
-
-    # 4.4. Salvar o resultado
-    if not os.path.exists(PASTA_SAIDA):
-        os.makedirs(PASTA_SAIDA)
+            return "Atenção: Pedido de compra não localizado!", 0.0
         
+        diferenca = round(row["Valor_Nota"] - row["Valor_Esperado"], 2)
+        
+        if diferenca == 0.0:
+            return "Conciliado (Valores Batem!)", 0.0
+        elif diferenca > 0.0:
+            return f"Divergência: Nota MAIOR que pedido", diferenca
+        else:
+            return f"Divergência: Nota MENOR que pedido", diferenca
+
+    # Aplica a função e separa o Status e o Valor da Diferença em duas colunas novas
+    resultados_status = df_conciliado.apply(verificar_status, axis=1)
+    df_conciliado["Status_Conciliacao"] = [res[0] for res in resultados_status]
+    df_conciliado["Valor_Diferenca"] = [res[1] for res in resultados_status]
+
+    # Organiza e limpa o DataFrame para salvar no Excel de forma organizada
+    df_relatorio_final = df_conciliado[[
+        "Numero_Nota", "CNPJ_Emissor", "Tipo_Arquivo", 
+        "Valor_Nota", "Valor_Esperado", "Valor_Diferenca", 
+        "Status_Conciliacao", "Nome_Arquivo", "Chave_Acesso"
+    ]].rename(columns={
+        "Numero_Nota": "Número da Nota",
+        "CNPJ_Emissor": "CNPJ Emitente",
+        "Tipo_Arquivo": "Tipo",
+        "Valor_Nota": "Valor da Nota (R$)",
+        "Valor_Esperado": "Valor do Pedido (R$)",
+        "Valor_Diferenca": "Diferença (R$)",
+        "Status_Conciliacao": "Status da Conciliação",
+        "Nome_Arquivo": "Arquivo Original"
+    })
+
+    # 4.4. Salvar o resultado na pasta 'saida'
     caminho_relatorio = os.path.join(PASTA_SAIDA, "resultado_financeiro.xlsx")
-    df_conciliado.to_excel(caminho_relatorio, index=False)
+    df_relatorio_final.to_excel(caminho_relatorio, index=False)
     
     print("\n--- PROCESSO CONCLUÍDO ---")
-    print(f"Relatório gerado em: {caminho_relatorio}")
-    print(df_conciliado[["Nome_Arquivo", "Tipo_Arquivo", "Valor_Nota", "Status_Conciliacao"]])
+    print(f"Relatório detalhado gerado com sucesso em: {caminho_relatorio}")
+    print(df_relatorio_final[["Número da Nota", "Valor da Nota (R$)", "Status da Conciliação"]])
 
-# Executa o script
 if __name__ == "__main__":
     executar_conciliacao()
